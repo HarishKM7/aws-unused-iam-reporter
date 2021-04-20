@@ -1,0 +1,88 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  DaysSincePasswordUsed:
+    Type: String
+    Description: Include IAM users in the report whose passwords haven't been used in X days.
+    Default: 30
+  DaysSinceKeyUsed:
+    Type: String
+    Description: Include access keys in the report that haven't been used in X days.
+    Default: 30
+  SNSTopicName:
+    Type: String
+    Description: Name of the SNS topic where the report will be published.
+    Default: unused-iam
+  LambdaSchedule:
+    Type: String
+    Description: |
+      CRON expression for when you want the Lambda function to run.
+      Default is 4 PM UTC = 9 AM PDT. CRON expression must be in UTC.
+    Default: cron(0 16 * * ? *)
+
+Resources:
+  UnusedIAMReporter:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: unused-iam-reporter
+      Runtime: python3.8
+      Timeout: 900
+      Handler: index.lambda_handler
+      Policies:
+        - IAMReadOnlyAccess
+        - SNSPublishMessagePolicy:
+            TopicName: !Ref SNSTopicName
+      Environment:
+        Variables:
+          DAYS_SINCE_PASSWORD_USED: !Ref DaysSincePasswordUsed
+          DAYS_SINCE_KEY_USED: !Ref DaysSinceKeyUsed
+          SNS_TOPIC_ARN: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${SNSTopicName}
+      Events:
+        Schedule:
+          Type: Schedule
+          Properties:
+            Name: unused-iam-reporter
+            Schedule: !Ref LambdaSchedule
+      InlineCode: |
+        import os
+        import datetime
+
+        import boto3
+        iam = boto3.client('iam')
+        sns = boto3.client('sns')
+
+        def lambda_handler(event, context):
+            report = ''
+            today = datetime.datetime.now()
+
+            for user in iam.list_users()['Users']:
+                passwordLastUsed = user['PasswordLastUsed'] \
+                    if 'PasswordLastUsed' in user \
+                    else user['CreateDate']
+
+                daysSincePasswordUsed = (today - passwordLastUsed.replace(tzinfo=None)).days
+
+                if daysSincePasswordUsed >= int(os.environ['DAYS_SINCE_PASSWORD_USED']):
+                    report += 'User: {0}. Days Since Password Used: {1}.\n' \
+                        .format(user['UserName'], daysSincePasswordUsed)
+
+                for key in iam.list_access_keys(UserName=user['UserName'])['AccessKeyMetadata']:
+                    lastUsed = iam.get_access_key_last_used \
+                        (AccessKeyId=key['AccessKeyId']) \
+                        ['AccessKeyLastUsed']
+
+                    keyLastUsed = lastUsed['LastUsedDate'] \
+                        if 'LastUsedDate' in lastUsed \
+                        else key['CreateDate']
+
+                    daysSinceKeyUsed = (today - keyLastUsed.replace(tzinfo=None)).days
+
+                    if daysSinceKeyUsed >= int(os.environ['DAYS_SINCE_KEY_USED']):
+                        report += 'Access Key ID: {0}. Days Since Key Used: {1}.\n' \
+                            .format(key['AccessKeyId'], daysSinceKeyUsed)
+
+            if report:
+                print(report)
+                sns.publish(TopicArn=os.environ['SNS_TOPIC_ARN'],
+                    Subject='Unused IAM Report', Message=report)
